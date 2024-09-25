@@ -424,6 +424,100 @@ class RustGenerator : public BaseGenerator {
                });
   }
 
+  class NamespaceNode {
+  public:
+    NamespaceNode(Namespace ns, RustGenerator* generator) : ns_(std::move(ns)), generator_(generator) {}
+
+    void AddDefinition(const Namespace* ns, const EnumDef* def) {
+      AddDefinition(ns, 0, [def](NamespaceNode* node) {
+        node->enum_definitions_.push_back(def);
+      });
+    }
+
+    void AddDefinition(const Namespace* ns, const StructDef* def) {
+      AddDefinition(ns, 0, [def](NamespaceNode* node) {
+        node->struct_definitions_.push_back(def);
+      });
+    }
+
+    void Generate() {
+      // Exit (and enter) namespaces as appropriate.
+      generator_->SetNameSpace(&ns_);
+
+      if (ns_.components.empty()) {
+        generator_->code_.IncrementIdentLevel();
+      }
+
+      // Generate all the enums (in this namespace).
+      for (auto enum_def : enum_definitions_) {
+        generator_->GenEnum(*enum_def);
+      }
+
+      // Generate all the structs and tables (in this namespace).
+      for (auto struct_def : struct_definitions_) {
+        if (struct_def->fixed) {
+          generator_->GenStruct(*struct_def);
+        } else {
+          generator_->GenTable(*struct_def);
+
+          if (generator_->parser_.opts.generate_object_based_api) {
+            generator_->GenTableObject(*struct_def);
+          }
+        }
+      }
+
+      /*
+       * TODO
+       * // Generate global helper functions.
+       * if (generator_->parser_.root_struct_def_) {
+       *   auto &struct_def = *generator_->parser_.root_struct_def_;
+       *   if (*struct_def.defined_namespace == ns_) {
+       *     GenRootTableFuncs(struct_def);
+       *   }
+       * }
+       */
+
+      // Recurse, generating child namespaces.
+      for (auto child : children_) {
+        auto child_namespace = it->second.get();
+        child_namespace->Generate();
+      }
+
+      if (ns_.components.empty()) {
+        generator_->code_.DecrementIdentLevel();
+      }
+    }
+
+  private:
+    Namespace ns_;
+    std::map<std::string, std::unique_ptr<NamespaceNode>> children_;
+    std::vector<const EnumDef*> enum_definitions_;
+    std::vector<const StructDef*> struct_definitions_;
+    RustGenerator* generator_;
+
+    // Traverse the tree, creating NamespaceNode's where necessary.
+    // Invokes func when reaching the target namespace.
+    void AddDefinition(const Namespace* ns, size_t offset, std::function<void(NamespaceNode*)> func) {
+      // Add definition to a node.
+      if (ns->components.size() == offset) {
+        func(this);
+        return;
+      }
+
+      auto ns_component = ns->components[offset];
+      auto child_it = children_.find(ns_component);
+
+      if (child_it == children_.end()) {
+        auto new_ns = Namespace();
+        new_ns.components = std::vector<std::string>(ns->components.begin(), ns->components.begin() + offset + 1);
+        auto result = children_.emplace(ns_component, std::make_unique<NamespaceNode>(new_ns, generator_));
+        result.first->second->AddDefinition(ns, offset + 1, func);
+      } else {
+        child_it->second->AddDefinition(ns, offset + 1, func);
+      }
+    }
+  };
+
   // Generates code organized by .fbs files. This is broken legacy behavior
   // that does not work with multiple fbs files with shared namespaces.
   // Iterate through all definitions we haven't generated code for (enums,
@@ -440,58 +534,22 @@ class RustGenerator : public BaseGenerator {
     GenNamespaceImports(0);
     code_ += "";
 
-    // Generate all code in their namespaces, once, because Rust does not
-    // permit re-opening modules.
-    //
-    // TODO(rw): Use a set data structure to reduce namespace evaluations from
-    //           O(n**2) to O(n).
-    for (auto ns_it = parser_.namespaces_.begin();
-         ns_it != parser_.namespaces_.end(); ++ns_it) {
-      const auto &ns = *ns_it;
+    NamespaceNode root = NamespaceNode(Namespace(), this);
 
-      // Generate code for all the enum declarations.
-      for (auto it = parser_.enums_.vec.begin(); it != parser_.enums_.vec.end();
-           ++it) {
-        const auto &enum_def = **it;
-        if (enum_def.defined_namespace == ns && !enum_def.generated) {
-          SetNameSpace(enum_def.defined_namespace);
-          GenEnum(enum_def);
-        }
-      }
-
-      // Generate code for all structs.
-      for (auto it = parser_.structs_.vec.begin();
-           it != parser_.structs_.vec.end(); ++it) {
-        const auto &struct_def = **it;
-        if (struct_def.defined_namespace == ns && struct_def.fixed &&
-            !struct_def.generated) {
-          SetNameSpace(struct_def.defined_namespace);
-          GenStruct(struct_def);
-        }
-      }
-
-      // Generate code for all tables.
-      for (auto it = parser_.structs_.vec.begin();
-           it != parser_.structs_.vec.end(); ++it) {
-        const auto &struct_def = **it;
-        if (struct_def.defined_namespace == ns && !struct_def.fixed &&
-            !struct_def.generated) {
-          SetNameSpace(struct_def.defined_namespace);
-          GenTable(struct_def);
-          if (parser_.opts.generate_object_based_api) {
-            GenTableObject(struct_def);
-          }
-        }
-      }
-
-      // Generate global helper functions.
-      if (parser_.root_struct_def_) {
-        auto &struct_def = *parser_.root_struct_def_;
-        if (struct_def.defined_namespace != ns) { continue; }
-        SetNameSpace(struct_def.defined_namespace);
-        GenRootTableFuncs(struct_def);
-      }
+    for (auto it = parser_.enums_.vec.begin(); it != parser_.enums_.vec.end();
+         it++) {
+      const auto &enum_def = **it;
+      root.AddDefinition(enum_def.defined_namespace, *it);
     }
+
+    for (auto it = parser_.structs_.vec.begin(); it != parser_.structs_.vec.end();
+         it++) {
+      const auto &struct_def = **it;
+      root.AddDefinition(struct_def.defined_namespace, *it);
+    }
+
+    root.Generate();
+
     if (cur_name_space_) SetNameSpace(nullptr);
 
     const auto file_path = GeneratedFileName(path_, file_name_, parser_.opts);
